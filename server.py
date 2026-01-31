@@ -3,6 +3,43 @@ import threading
 import json
 import os
 import uuid
+import time
+import struct
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+
+def send_msg(sock, msg_dict):
+    """Send a length-prefixed JSON message"""
+    msg_json = json.dumps(msg_dict)
+    msg_bytes = msg_json.encode('utf-8')
+    msg_len = len(msg_bytes)
+    # Send 4-byte length prefix, then the message
+    sock.sendall(struct.pack('!I', msg_len) + msg_bytes)
+
+def recv_msg(sock):
+    """Receive a length-prefixed JSON message"""
+    # Read 4-byte length prefix
+    raw_msglen = recv_all(sock, 4)
+    if not raw_msglen:
+        return None
+    msglen = struct.unpack('!I', raw_msglen)[0]
+    # Read the message data
+    msg_bytes = recv_all(sock, msglen)
+    if not msg_bytes:
+        return None
+    return json.loads(msg_bytes.decode('utf-8'))
+
+def recv_all(sock, n):
+    """Helper to receive exactly n bytes"""
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
 
 # =========================
 # DEFAULT FILES
@@ -67,10 +104,39 @@ with open("commands.json", "w") as f:
 WORLD_NAME = config["world-name"]
 WORLD_DIR = f"worlds/{WORLD_NAME}"
 WORLD_PATH = f"{WORLD_DIR}/world.json"
+PLAYERS_PATH = f"{WORLD_DIR}/players.json"
 os.makedirs(WORLD_DIR, exist_ok=True)
 
 if not os.path.exists(WORLD_PATH):
-    world = [["air"] * 10 for _ in range(10)]
+    # Create a more interesting world with terrain layers
+    world = []
+    world_width = 100
+    world_height = 30
+    
+    for y in range(world_height):
+        row = []
+        for x in range(world_width):
+            # Top layers: air
+            if y < 5:
+                row.append("air")
+            # Grass layer
+            elif y == 5:
+                row.append("grass")
+            # Dirt layers
+            elif y >= 6 and y < 10:
+                row.append("dirt")
+            # Sand/dirt mix
+            elif y >= 10 and y < 15:
+                # Add some sand patches
+                if x % 7 == 0 or x % 11 == 0:
+                    row.append("sand")
+                else:
+                    row.append("dirt")
+            # Stone layers at bottom
+            else:
+                row.append("stone")
+        world.append(row)
+    
     with open(WORLD_PATH, "w") as f:
         json.dump(world, f)
     print(f"[SERVER] Created new world at {WORLD_PATH}")
@@ -78,11 +144,21 @@ else:
     with open(WORLD_PATH) as f:
         world = json.load(f)
 
+# Load player data (positions, hotbars)
+if not os.path.exists(PLAYERS_PATH):
+    player_data = {}
+    with open(PLAYERS_PATH, "w") as f:
+        json.dump(player_data, f)
+else:
+    with open(PLAYERS_PATH) as f:
+        player_data = json.load(f)
+
 # =========================
 # SERVER STATE
 # =========================
 
 clients = {}  # player_id -> socket
+player_positions = {}  # player_id -> (x, y)
 lock = threading.Lock()
 
 # =========================
@@ -126,6 +202,10 @@ def save_world():
     with open(WORLD_PATH, "w") as f:
         json.dump(world, f)
 
+def save_players():
+    with open(PLAYERS_PATH, "w") as f:
+        json.dump(player_data, f)
+
 # =========================
 # PLAYER ACTIONS
 # =========================
@@ -133,10 +213,10 @@ def save_world():
 def kick(pid, reason="Kicked"):
     if pid in clients:
         try:
-            clients[pid].send(json.dumps({
+            send_msg(clients[pid], {
                 "type": "disconnect",
                 "reason": reason
-            }).encode())
+            })
             clients[pid].close()
         except:
             pass
@@ -148,67 +228,72 @@ def set_perm(pid, level):
         json.dump(permissions, f, indent=4)
 
 # =========================
+# BROADCAST
+# =========================
+
+def broadcast(msg, exclude=None):
+    with lock:
+        for pid, sock in clients.items():
+            if pid != exclude:
+                try:
+                    send_msg(sock, msg)
+                except:
+                    pass
+
+# =========================
 # COMMAND HANDLER
 # =========================
 
 def handle_command(sender, cmdline):
     parts = cmdline.split()
     if not parts:
-        return
+        return None
     cmd = parts[0][1:]
 
     if cmd not in command_perms:
-        print(f"[SERVER] Command '{cmd}' does not exist.")
-        return
+        return f"Command '{cmd}' does not exist."
 
     if not can_execute(sender, cmd):
-        print(f"[SERVER] You do not have permission to execute '{cmd}'.")
-        return
+        return f"You do not have permission to execute '{cmd}'."
 
     try:
         if cmd == "kick":
             if len(parts) < 2:
-                print("[SERVER] Usage: /kick <player_id>")
-                return
+                return "Usage: /kick <player_id>"
             kick(parts[1])
-            print(f"[SERVER] Player {parts[1]} kicked.")
+            return f"Player {parts[1]} kicked."
 
         elif cmd == "ban":
             if len(parts) < 2:
-                print("[SERVER] Usage: /ban <player_id>")
-                return
+                return "Usage: /ban <player_id>"
             ban(parts[1])
-            print(f"[SERVER] Player {parts[1]} banned.")
+            return f"Player {parts[1]} banned."
 
         elif cmd == "mute":
             if len(parts) < 2:
-                print("[SERVER] Usage: /mute <player_id>")
-                return
+                return "Usage: /mute <player_id>"
             mute(parts[1])
-            print(f"[SERVER] Player {parts[1]} muted.")
+            return f"Player {parts[1]} muted."
 
         elif cmd == "unpunish":
             if len(parts) < 2:
-                print("[SERVER] Usage: /unpunish <player_id>")
-                return
+                return "Usage: /unpunish <player_id>"
             unpunish(parts[1])
-            print(f"[SERVER] Player {parts[1]} unpunished.")
+            return f"Player {parts[1]} unpunished."
 
         elif cmd == "perms":
             if len(parts) < 3:
-                print("[SERVER] Usage: /perms <player_id> <level>")
-                return
+                return "Usage: /perms <player_id> <level>"
             set_perm(parts[1], int(parts[2]))
-            print(f"[SERVER] Player {parts[1]}'s permission set to {parts[2]}.")
+            return f"Player {parts[1]}'s permission set to {parts[2]}."
 
         elif cmd == "help":
-            print("[SERVER] Available commands:")
-            for c in command_perms:
-                print(f"  /{c}")
+            return "Available commands: " + ", ".join([f"/{c}" for c in command_perms])
 
         elif cmd == "stop":
             print("[SERVER] Stopping server safely...")
             save_world()
+            save_players()
             save_blacklist()
             with open("permission.json", "w") as f:
                 json.dump(permissions, f, indent=4)
@@ -216,61 +301,240 @@ def handle_command(sender, cmdline):
             os._exit(0)
 
         else:
-            print(f"[SERVER] Command '{cmd}' is not implemented yet.")
+            return f"Command '{cmd}' is not implemented yet."
 
     except Exception as e:
-        print(f"[SERVER] Error executing command '{cmd}': {e}")
+        return f"Error executing command '{cmd}': {e}"
 
 # =========================
 # CLIENT THREAD
 # =========================
 
 def client_thread(client, addr):
-    pid = str(uuid.uuid4())[:6]
-
-    if blacklist.get(pid) == "banned":
-        client.close()
-        return
-
-    with lock:
-        clients[pid] = client
-
+    pid = None
+    is_refresh = True  # Assume it's a refresh until proven otherwise
     try:
-        client.send(json.dumps({
-            "type": "welcome",
-            "id": pid,
-            "motd": config["server-motd"],
-            "server": config["server-name"],
-            "world": world
-        }).encode())
-    except:
-        clients.pop(pid, None)
-        return
+        # Receive player ID from client
+        msg = recv_msg(client)
+        if not msg or msg.get("type") != "login":
+            client.close()
+            return
+        
+        pid = msg["id"]
+        
+        if blacklist.get(pid) == "banned":
+            send_msg(client, {
+                "type": "disconnect",
+                "reason": "You are banned from this server"
+            })
+            client.close()
+            return
 
-    while True:
+        with lock:
+            clients[pid] = client
+            
+            # Initialize player data if not exists
+            if pid not in player_data:
+                player_data[pid] = {
+                    "x": 10,
+                    "y": 3,
+                    "hotbar": [{"block": "stone", "count": 10}] + [None] * 6
+                }
+                save_players()
+            
+            player_positions[pid] = (player_data[pid]["x"], player_data[pid]["y"])
+
+        # Send welcome packet
         try:
-            data = client.recv(4096)
-            if not data:
+            send_msg(client, {
+                "type": "welcome",
+                "id": pid,
+                "motd": config["server-motd"],
+                "server": config["server-name"],
+                "world": world,
+                "x": player_data[pid]["x"],
+                "y": player_data[pid]["y"],
+                "hotbar": player_data[pid]["hotbar"],
+                "level": get_level(pid)
+            })
+        except:
+            with lock:
+                clients.pop(pid, None)
+                player_positions.pop(pid, None)
+            client.close()
+            return
+
+        # Send all other players' positions
+        with lock:
+            for other_pid, pos in player_positions.items():
+                if other_pid != pid:
+                    try:
+                        send_msg(client, {
+                            "type": "player_join",
+                            "id": other_pid,
+                            "x": pos[0],
+                            "y": pos[1]
+                        })
+                    except:
+                        pass
+
+        # Broadcast new player joined
+        broadcast({
+            "type": "player_join",
+            "id": pid,
+            "x": player_positions[pid][0],
+            "y": player_positions[pid][1]
+        }, exclude=pid)
+
+        while True:
+            try:
+                msg = recv_msg(client)
+                if not msg:
+                    break
+
+                # If we receive any message, it's not just a refresh
+                if is_refresh:
+                    is_refresh = False
+                    print(f"[SERVER] Player {pid} connected from {addr}")
+
+                if msg["type"] == "chat":
+                    if blacklist.get(pid) == "muted":
+                        send_msg(client, {
+                            "type": "chat",
+                            "from": "SERVER",
+                            "level": 999,
+                            "message": "You are muted."
+                        })
+                    else:
+                        message_text = msg["message"]
+                        if message_text.startswith("/"):
+                            # Handle command
+                            result = handle_command(pid, message_text)
+                            if result:
+                                send_msg(client, {
+                                    "type": "chat",
+                                    "from": "SERVER",
+                                    "level": 999,
+                                    "message": result
+                                })
+                        else:
+                            # Broadcast chat message
+                            broadcast({
+                                "type": "chat",
+                                "from": pid,
+                                "level": get_level(pid),
+                                "message": message_text
+                            })
+
+                elif msg["type"] == "move":
+                    x, y = msg["x"], msg["y"]
+                    with lock:
+                        player_positions[pid] = (x, y)
+                        player_data[pid]["x"] = x
+                        player_data[pid]["y"] = y
+                    
+                    # Broadcast position update
+                    broadcast({
+                        "type": "player_move",
+                        "id": pid,
+                        "x": x,
+                        "y": y
+                    }, exclude=pid)
+
+                elif msg["type"] == "break_block":
+                    x, y = msg["x"], msg["y"]
+                    if 0 <= y < len(world) and 0 <= x < len(world[0]):
+                        broken_block = world[y][x]
+                        if broken_block != "air":
+                            world[y][x] = "air"
+                            save_world()
+                            
+                            # Add to player's hotbar
+                            hotbar = player_data[pid]["hotbar"]
+                            added = False
+                            for slot in hotbar:
+                                if slot and slot["block"] == broken_block:
+                                    slot["count"] += 1
+                                    added = True
+                                    break
+                            
+                            if not added:
+                                for i, slot in enumerate(hotbar):
+                                    if slot is None:
+                                        hotbar[i] = {"block": broken_block, "count": 1}
+                                        added = True
+                                        break
+                            
+                            save_players()
+                            
+                            # Send updated hotbar to player
+                            send_msg(client, {
+                                "type": "hotbar_update",
+                                "hotbar": hotbar
+                            })
+                            
+                            # Broadcast block update
+                            broadcast({
+                                "type": "update_block",
+                                "x": x,
+                                "y": y,
+                                "block": "air"
+                            })
+
+                elif msg["type"] == "place_block":
+                    x, y = msg["x"], msg["y"]
+                    slot_index = msg["slot"]
+                    
+                    if 0 <= y < len(world) and 0 <= x < len(world[0]):
+                        if world[y][x] == "air":
+                            hotbar = player_data[pid]["hotbar"]
+                            if 0 <= slot_index < len(hotbar) and hotbar[slot_index]:
+                                block_type = hotbar[slot_index]["block"]
+                                hotbar[slot_index]["count"] -= 1
+                                
+                                if hotbar[slot_index]["count"] <= 0:
+                                    hotbar[slot_index] = None
+                                
+                                world[y][x] = block_type
+                                save_world()
+                                save_players()
+                                
+                                # Send updated hotbar to player
+                                send_msg(client, {
+                                    "type": "hotbar_update",
+                                    "hotbar": hotbar
+                                })
+                                
+                                # Broadcast block update
+                                broadcast({
+                                    "type": "update_block",
+                                    "x": x,
+                                    "y": y,
+                                    "block": block_type
+                                })
+
+            except:
                 break
 
-            msg = json.loads(data.decode())
-
-            if msg["type"] == "command":
-                if blacklist.get(pid) != "muted":
-                    handle_command(pid, msg["command"])
-
-            elif msg["type"] == "break_block":
-                x, y = msg["x"], msg["y"]
-                if 0 <= y < len(world) and 0 <= x < len(world[0]):
-                    world[y][x] = "air"
-                    save_world()
-
-        except:
-            break
-
-    with lock:
-        clients.pop(pid, None)
-    client.close()
+    except Exception as e:
+        print(f"[SERVER] Error with client: {e}")
+    finally:
+        if pid:
+            with lock:
+                clients.pop(pid, None)
+                player_positions.pop(pid, None)
+            
+            # Only log disconnect and broadcast if they were actually playing
+            if not is_refresh:
+                # Broadcast player left
+                broadcast({
+                    "type": "player_leave",
+                    "id": pid
+                })
+                
+                print(f"[SERVER] Player {pid} disconnected")
+        
+        client.close()
 
 # =========================
 # CONSOLE THREAD
@@ -280,13 +544,16 @@ def console():
     while True:
         cmd = input(">>> ")
         if cmd.startswith("/"):
-            handle_command("CONSOLE", cmd)
+            result = handle_command("CONSOLE", cmd)
+            if result:
+                print(f"[SERVER] {result}")
 
 # =========================
 # START SERVER
 # =========================
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server.bind((config["host"], config["port"]))
 server.listen(config["max_players"])
 
