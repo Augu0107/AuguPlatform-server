@@ -62,7 +62,8 @@ DEFAULT_COMMANDS = {
     "kick": 1,
     "perms": 3,
     "help": 0,
-    "stop": 3
+    "stop": 3,
+    "respawn": 0
 }
 
 # =========================
@@ -132,9 +133,12 @@ if not os.path.exists(WORLD_PATH):
                     row.append("sand")
                 else:
                     row.append("dirt")
-            # Stone layers at bottom
-            else:
+            # Stone layers
+            elif y >= 15 and y < world_height - 1:
                 row.append("stone")
+            # Bedrock at bottom (unbreakable)
+            else:
+                row.append("bedrock")
         world.append(row)
     
     with open(WORLD_PATH, "w") as f:
@@ -267,6 +271,9 @@ def handle_command(sender, cmdline):
             if len(parts) < 2:
                 return "Usage: /ban <player_id>"
             ban(parts[1])
+            # Kick if online
+            if parts[1] in clients:
+                kick(parts[1], "You have been banned")
             return f"Player {parts[1]} banned."
 
         elif cmd == "mute":
@@ -289,6 +296,24 @@ def handle_command(sender, cmdline):
 
         elif cmd == "help":
             return "Available commands: " + ", ".join([f"/{c}" for c in command_perms])
+
+        elif cmd == "respawn":
+            if sender == "CONSOLE":
+                return "This command cannot be used from console."
+            # Respawn player
+            if sender in player_data:
+                player_data[sender]["x"] = 10
+                player_data[sender]["y"] = 3
+                save_players()
+                # Send respawn packet
+                if sender in clients:
+                    send_msg(clients[sender], {
+                        "type": "respawn",
+                        "x": 10,
+                        "y": 3
+                    })
+                return "You have been respawned."
+            return "Error respawning."
 
         elif cmd == "stop":
             print("[SERVER] Stopping server safely...")
@@ -321,6 +346,18 @@ def client_thread(client, addr):
             return
         
         pid = msg["id"]
+        password = msg.get("password", "")
+        color = msg.get("color", "blue")
+        
+        # Check password
+        server_password = str(config.get("password_server", 0))
+        if server_password != "0" and password != server_password:
+            send_msg(client, {
+                "type": "disconnect",
+                "reason": "Incorrect password"
+            })
+            client.close()
+            return
         
         if blacklist.get(pid) == "banned":
             send_msg(client, {
@@ -338,8 +375,13 @@ def client_thread(client, addr):
                 player_data[pid] = {
                     "x": 10,
                     "y": 3,
-                    "hotbar": [{"block": "stone", "count": 10}] + [None] * 6
+                    "hotbar": [{"block": "stone", "count": 10}] + [None] * 6,
+                    "color": color
                 }
+                save_players()
+            else:
+                # Update color
+                player_data[pid]["color"] = color
                 save_players()
             
             player_positions[pid] = (player_data[pid]["x"], player_data[pid]["y"])
@@ -355,7 +397,8 @@ def client_thread(client, addr):
                 "x": player_data[pid]["x"],
                 "y": player_data[pid]["y"],
                 "hotbar": player_data[pid]["hotbar"],
-                "level": get_level(pid)
+                "level": get_level(pid),
+                "color": player_data[pid].get("color", "blue")
             })
         except:
             with lock:
@@ -364,7 +407,7 @@ def client_thread(client, addr):
             client.close()
             return
 
-        # Send all other players' positions
+        # Send all other players' positions and colors
         with lock:
             for other_pid, pos in player_positions.items():
                 if other_pid != pid:
@@ -373,7 +416,8 @@ def client_thread(client, addr):
                             "type": "player_join",
                             "id": other_pid,
                             "x": pos[0],
-                            "y": pos[1]
+                            "y": pos[1],
+                            "color": player_data[other_pid].get("color", "blue")
                         })
                     except:
                         pass
@@ -383,7 +427,8 @@ def client_thread(client, addr):
             "type": "player_join",
             "id": pid,
             "x": player_positions[pid][0],
-            "y": player_positions[pid][1]
+            "y": player_positions[pid][1],
+            "color": player_data[pid].get("color", "blue")
         }, exclude=pid)
 
         while True:
@@ -441,11 +486,30 @@ def client_thread(client, addr):
                         "y": y
                     }, exclude=pid)
 
+                elif msg["type"] == "update_color":
+                    color = msg.get("color", "blue")
+                    player_data[pid]["color"] = color
+                    save_players()
+                    
+                    # Broadcast color update to all players
+                    broadcast({
+                        "type": "player_color",
+                        "id": pid,
+                        "color": color
+                    }, exclude=pid)
+                    
+                    # Confirm to sender
+                    send_msg(client, {
+                        "type": "color_updated",
+                        "color": color
+                    })
+
                 elif msg["type"] == "break_block":
                     x, y = msg["x"], msg["y"]
                     if 0 <= y < len(world) and 0 <= x < len(world[0]):
                         broken_block = world[y][x]
-                        if broken_block != "air":
+                        # Cannot break bedrock or air
+                        if broken_block != "air" and broken_block != "bedrock":
                             world[y][x] = "air"
                             save_world()
                             
