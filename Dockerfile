@@ -11,4 +11,4 @@ WORKDIR /
 
 
 # Define the entry point for the container
-CMD ["python", "server.py", "runserver", "0.0.0.0:8000"]
+CMD ["python", "server.py"]
