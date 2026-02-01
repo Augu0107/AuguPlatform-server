@@ -10,7 +10,7 @@ COPY . /
 
 
 # Espone la porta richiesta (8080 per la piattaforma cloud)
-EXPOSE 8080
+EXPOSE 12345
 
 # Avvia il server
 CMD ["python", "server.py"]
