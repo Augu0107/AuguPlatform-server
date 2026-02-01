@@ -7,7 +7,7 @@ WORKDIR /
 COPY . /
 
 # Installa dipendenze se hai requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+
 
 # Espone la porta richiesta (8080 per la piattaforma cloud)
 EXPOSE 8080
