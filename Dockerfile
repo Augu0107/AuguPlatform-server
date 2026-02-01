@@ -1,14 +1,16 @@
-# Use the official Python image as the base image
 FROM python:3.8
 
-# Set the working directory in the container
+# Imposta la working directory
 WORKDIR /
 
-# Copy the application files into the working directory
+# Copia tutti i file della cartella del Dockerfile nella root del container
+COPY . /
 
+# Installa dipendenze se hai requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install the application dependencies
+# Espone la porta richiesta (8080 per la piattaforma cloud)
 EXPOSE 8080
 
-# Define the entry point for the container
+# Avvia il server
 CMD ["python", "server.py"]
