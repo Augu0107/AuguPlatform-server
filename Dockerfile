@@ -8,7 +8,7 @@ WORKDIR /
 
 
 # Install the application dependencies
-
+EXPOSE 8080
 
 # Define the entry point for the container
 CMD ["python", "server.py"]
