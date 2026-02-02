@@ -52,7 +52,8 @@ DEFAULT_CONFIG = {
     "password_server": 0,
     "world-name": "world",
     "server-motd": "A simple server",
-    "server-name": "My server"
+    "server-name": "My server",
+    "console_mode": "interactive"  # "interactive" or "pterodactyl"
 }
 
 DEFAULT_COMMANDS = {
@@ -63,7 +64,9 @@ DEFAULT_COMMANDS = {
     "perms": 3,
     "help": 0,
     "stop": 3,
-    "respawn": 0
+    "respawn": 0,
+    "tp": 0,
+    "give": 0
 }
 
 # =========================
@@ -315,6 +318,92 @@ def handle_command(sender, cmdline):
                 return "You have been respawned."
             return "Error respawning."
 
+        elif cmd == "tp":
+            if sender == "CONSOLE":
+                return "This command cannot be used from console."
+            if len(parts) < 2:
+                return "Usage: /tp <player_id>"
+            
+            target_id = parts[1]
+            
+            # Check if target exists
+            if target_id not in player_data:
+                return f"Player {target_id} not found."
+            
+            # Get target position
+            target_x = player_data[target_id]["x"]
+            target_y = player_data[target_id]["y"]
+            
+            # Teleport sender to target
+            player_data[sender]["x"] = target_x
+            player_data[sender]["y"] = target_y
+            player_positions[sender] = (target_x, target_y)
+            save_players()
+            
+            # Send respawn packet to update position
+            if sender in clients:
+                send_msg(clients[sender], {
+                    "type": "respawn",
+                    "x": target_x,
+                    "y": target_y
+                })
+            
+            return f"Teleported to {target_id} at ({target_x}, {target_y})."
+
+        elif cmd == "give":
+            if sender == "CONSOLE":
+                return "This command cannot be used from console."
+            if len(parts) < 3:
+                return "Usage: /give <block_type> <quantity>"
+            
+            block_type = parts[1]
+            try:
+                quantity = int(parts[2])
+            except:
+                return "Quantity must be a number."
+            
+            if quantity <= 0 or quantity > 999:
+                return "Quantity must be between 1 and 999."
+            
+            # Valid block types
+            valid_blocks = ["dirt", "grass", "stone", "sand", "wood"]
+            if block_type not in valid_blocks:
+                return f"Invalid block type. Valid: {', '.join(valid_blocks)}"
+            
+            # Add to player's hotbar (first empty slot or stack)
+            if sender in player_data:
+                hotbar = player_data[sender]["hotbar"]
+                
+                # Try to find existing stack
+                for i, slot in enumerate(hotbar):
+                    if slot and slot["block"] == block_type:
+                        slot["count"] += quantity
+                        save_players()
+                        # Update client
+                        if sender in clients:
+                            send_msg(clients[sender], {
+                                "type": "hotbar_update",
+                                "hotbar": hotbar
+                            })
+                        return f"Added {quantity} {block_type} to your hotbar."
+                
+                # Try to find empty slot
+                for i, slot in enumerate(hotbar):
+                    if slot is None:
+                        hotbar[i] = {"block": block_type, "count": quantity}
+                        save_players()
+                        # Update client
+                        if sender in clients:
+                            send_msg(clients[sender], {
+                                "type": "hotbar_update",
+                                "hotbar": hotbar
+                            })
+                        return f"Added {quantity} {block_type} to your hotbar."
+                
+                return "Hotbar is full!"
+            
+            return "Error giving items."
+
         elif cmd == "stop":
             print("[SERVER] Stopping server safely...")
             save_world()
@@ -398,7 +487,9 @@ def client_thread(client, addr):
                 "y": player_data[pid]["y"],
                 "hotbar": player_data[pid]["hotbar"],
                 "level": get_level(pid),
-                "color": player_data[pid].get("color", "blue")
+                "color": player_data[pid].get("color", "blue"),
+                "max_players": config["max_players"],
+                "current_players": len(clients)
             })
         except:
             with lock:
@@ -605,12 +696,79 @@ def client_thread(client, addr):
 # =========================
 
 def console():
-    while True:
-        cmd = input(">>> ")
-        if cmd.startswith("/"):
-            result = handle_command("CONSOLE", cmd)
-            if result:
-                print(f"[SERVER] {result}")
+    """Console input thread - works with Pterodactyl when started with python -u"""
+    import sys
+    
+    console_mode = config.get("console_mode", "interactive")
+    
+    print("=" * 60, flush=True)
+    print(f"[SERVER] Console mode: {console_mode}", flush=True)
+    
+    if console_mode == "pterodactyl":
+        print("[SERVER] Pterodactyl Console Active", flush=True)
+        print("[SERVER] ", flush=True)
+        print("[SERVER] IMPORTANT: Start server with 'python3 -u server.py'", flush=True)
+        print("[SERVER] The -u flag enables unbuffered I/O", flush=True)
+        print("[SERVER] ", flush=True)
+        print("[SERVER] Type your commands below:", flush=True)
+        print("[SERVER] Example: /help", flush=True)
+        print("=" * 60, flush=True)
+        
+        while True:
+            try:
+                line = sys.stdin.readline()
+                
+                if line:
+                    cmd = line.strip()
+                    
+                    if cmd:
+                        # Echo what we received
+                        print(f"[CONSOLE] >> {cmd}", flush=True)
+                        
+                        if cmd.startswith("/"):
+                            result = handle_command("CONSOLE", cmd)
+                            if result:
+                                print(f"[SERVER] {result}", flush=True)
+                        else:
+                            print(f"[SERVER] Commands must start with / ", flush=True)
+                            print(f"[SERVER] Try: /help", flush=True)
+                            
+            except KeyboardInterrupt:
+                print("[SERVER] Shutting down...", flush=True)
+                break
+            except Exception as e:
+                print(f"[SERVER] Console error: {e}", flush=True)
+                time.sleep(0.1)
+    else:
+        # Interactive mode
+        print("[SERVER] Interactive console ready", flush=True)
+        print("=" * 60, flush=True)
+        
+        while True:
+            try:
+                cmd = input(">>> ")
+                if cmd.startswith("/"):
+                    result = handle_command("CONSOLE", cmd)
+                    if result:
+                        print(f"[SERVER] {result}")
+            except EOFError:
+                print("[SERVER] EOF - switching to non-interactive...", flush=True)
+                while True:
+                    try:
+                        line = sys.stdin.readline()
+                        if line:
+                            cmd = line.strip()
+                            if cmd:
+                                print(f"[CONSOLE] >> {cmd}", flush=True)
+                                if cmd.startswith("/"):
+                                    result = handle_command("CONSOLE", cmd)
+                                    if result:
+                                        print(f"[SERVER] {result}", flush=True)
+                    except:
+                        time.sleep(1)
+            except Exception as e:
+                print(f"[SERVER] Console error: {e}")
+                time.sleep(1)
 
 # =========================
 # START SERVER
