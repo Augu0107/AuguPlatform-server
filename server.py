@@ -66,7 +66,8 @@ DEFAULT_COMMANDS = {
     "stop": 3,
     "respawn": 0,
     "tp": 0,
-    "give": 0
+    "give": 0,
+    "clear": 0  # Clear inventory and hotbar
 }
 
 # =========================
@@ -144,9 +145,33 @@ if not os.path.exists(WORLD_PATH):
                 row.append("bedrock")
         world.append(row)
     
+    # Generate trees on grass
+    import random
+    random.seed(42)  # Consistent trees
+    for x in range(5, world_width - 5):  # Leave margins
+        # 10% chance of tree on each grass block
+        if random.random() < 0.1:
+            # Tree structure: log trunk (3 blocks) + leaves (5x3 top)
+            trunk_height = 3
+            
+            # Place trunk (log blocks)
+            for trunk_y in range(3):  # y=2,3,4 (above grass at y=5)
+                if world[5 - trunk_y - 1][x] == "air":
+                    world[5 - trunk_y - 1][x] = "log"
+            
+            # Place leaves (5 wide, 3 tall, centered on top of trunk)
+            leaves_y_start = 5 - trunk_height - 2  # Top of leaves
+            for ly in range(3):  # 3 rows of leaves
+                leaves_y = leaves_y_start + ly
+                if leaves_y >= 0:
+                    for lx in range(-2, 3):  # 5 wide (-2, -1, 0, 1, 2)
+                        leaves_x = x + lx
+                        if 0 <= leaves_x < world_width and world[leaves_y][leaves_x] == "air":
+                            world[leaves_y][leaves_x] = "leaves"
+    
     with open(WORLD_PATH, "w") as f:
         json.dump(world, f)
-    print(f"[SERVER] Created new world at {WORLD_PATH}")
+    print(f"[SERVER] Created new world with trees at {WORLD_PATH}")
 else:
     with open(WORLD_PATH) as f:
         world = json.load(f)
@@ -366,43 +391,73 @@ def handle_command(sender, cmdline):
                 return "Quantity must be between 1 and 999."
             
             # Valid block types
-            valid_blocks = ["dirt", "grass", "stone", "sand", "wood"]
+            valid_blocks = ["dirt", "grass", "stone", "sand", "wood", "ladder", "log", "leaves"]
             if block_type not in valid_blocks:
                 return f"Invalid block type. Valid: {', '.join(valid_blocks)}"
             
             # Add to player's hotbar (first empty slot or stack)
             if sender in player_data:
                 hotbar = player_data[sender]["hotbar"]
+                original_quantity = quantity
                 
-                # Try to find existing stack
+                # Try to stack in existing slots (max 64 per slot)
                 for i, slot in enumerate(hotbar):
-                    if slot and slot["block"] == block_type:
-                        slot["count"] += quantity
-                        save_players()
-                        # Update client
-                        if sender in clients:
-                            send_msg(clients[sender], {
-                                "type": "hotbar_update",
-                                "hotbar": hotbar
-                            })
-                        return f"Added {quantity} {block_type} to your hotbar."
+                    if slot and slot["block"] == block_type and quantity > 0:
+                        space_available = 64 - slot["count"]
+                        if space_available > 0:
+                            add_amount = min(quantity, space_available)
+                            slot["count"] += add_amount
+                            quantity -= add_amount
                 
-                # Try to find empty slot
+                # Fill empty slots with remaining quantity (max 64 per slot)
                 for i, slot in enumerate(hotbar):
-                    if slot is None:
-                        hotbar[i] = {"block": block_type, "count": quantity}
-                        save_players()
-                        # Update client
-                        if sender in clients:
-                            send_msg(clients[sender], {
-                                "type": "hotbar_update",
-                                "hotbar": hotbar
-                            })
-                        return f"Added {quantity} {block_type} to your hotbar."
+                    if slot is None and quantity > 0:
+                        add_amount = min(quantity, 64)
+                        hotbar[i] = {"block": block_type, "count": add_amount}
+                        quantity -= add_amount
+                
+                # Save and update client once at the end
+                if original_quantity > quantity:  # Something was added
+                    save_players()
+                    if sender in clients:
+                        send_msg(clients[sender], {
+                            "type": "hotbar_update",
+                            "hotbar": hotbar
+                        })
+                    
+                    added = original_quantity - quantity
+                    if quantity > 0:
+                        return f"Added {added}/{original_quantity} {block_type}. Hotbar full, {quantity} items couldn't fit."
+                    return f"Added {added} {block_type} to your hotbar."
                 
                 return "Hotbar is full!"
             
             return "Error giving items."
+        
+        elif cmd == "clear":
+            if sender == "CONSOLE":
+                return "This command cannot be used from console."
+            
+            # Clear hotbar and inventory
+            if sender in player_data:
+                player_data[sender]["hotbar"] = [None] * 7
+                player_data[sender]["inventory"] = [None] * 21
+                save_players()
+                
+                # Update client
+                if sender in clients:
+                    send_msg(clients[sender], {
+                        "type": "hotbar_update",
+                        "hotbar": player_data[sender]["hotbar"]
+                    })
+                    send_msg(clients[sender], {
+                        "type": "inventory_update",
+                        "inventory": player_data[sender]["inventory"]
+                    })
+                
+                return "Cleared your inventory and hotbar!"
+            
+            return "Error clearing inventory."
 
         elif cmd == "stop":
             print("[SERVER] Stopping server safely...")
@@ -465,12 +520,16 @@ def client_thread(client, addr):
                     "x": 10,
                     "y": 3,
                     "hotbar": [{"block": "stone", "count": 10}] + [None] * 6,
+                    "inventory": [None] * 21,  # Initialize empty inventory!
                     "color": color
                 }
                 save_players()
             else:
                 # Update color
                 player_data[pid]["color"] = color
+                # Ensure inventory exists for old players
+                if "inventory" not in player_data[pid]:
+                    player_data[pid]["inventory"] = [None] * 21
                 save_players()
             
             player_positions[pid] = (player_data[pid]["x"], player_data[pid]["y"])
@@ -486,6 +545,7 @@ def client_thread(client, addr):
                 "x": player_data[pid]["x"],
                 "y": player_data[pid]["y"],
                 "hotbar": player_data[pid]["hotbar"],
+                "inventory": player_data[pid].get("inventory", [None] * 21),  # Send inventory!
                 "level": get_level(pid),
                 "color": player_data[pid].get("color", "blue"),
                 "max_players": config["max_players"],
@@ -604,15 +664,27 @@ def client_thread(client, addr):
                             world[y][x] = "air"
                             save_world()
                             
-                            # Add to player's hotbar
+                            # Add to player's hotbar (with 64 stack limit)
                             hotbar = player_data[pid]["hotbar"]
+                            inventory = player_data[pid].get("inventory", [None] * 21)
                             added = False
+                            
+                            # Try to stack in existing hotbar slot (max 64)
                             for slot in hotbar:
-                                if slot and slot["block"] == broken_block:
+                                if slot and slot["block"] == broken_block and slot["count"] < 64:
                                     slot["count"] += 1
                                     added = True
                                     break
                             
+                            # Try to stack in existing inventory slot (max 64)
+                            if not added:
+                                for slot in inventory:
+                                    if slot and slot["block"] == broken_block and slot["count"] < 64:
+                                        slot["count"] += 1
+                                        added = True
+                                        break
+                            
+                            # Try empty hotbar slot
                             if not added:
                                 for i, slot in enumerate(hotbar):
                                     if slot is None:
@@ -620,12 +692,25 @@ def client_thread(client, addr):
                                         added = True
                                         break
                             
+                            # Try empty inventory slot
+                            if not added:
+                                for i, slot in enumerate(inventory):
+                                    if slot is None:
+                                        inventory[i] = {"block": broken_block, "count": 1}
+                                        added = True
+                                        break
+                            
+                            player_data[pid]["inventory"] = inventory
                             save_players()
                             
-                            # Send updated hotbar to player
+                            # Send updated hotbar AND inventory to player
                             send_msg(client, {
                                 "type": "hotbar_update",
                                 "hotbar": hotbar
+                            })
+                            send_msg(client, {
+                                "type": "inventory_update",
+                                "inventory": inventory
                             })
                             
                             # Broadcast block update
@@ -641,7 +726,7 @@ def client_thread(client, addr):
                     slot_index = msg["slot"]
                     
                     if 0 <= y < len(world) and 0 <= x < len(world[0]):
-                        if world[y][x] == "air":
+                        if world[y][x] in ["air", "ladder"]:
                             hotbar = player_data[pid]["hotbar"]
                             if 0 <= slot_index < len(hotbar) and hotbar[slot_index]:
                                 block_type = hotbar[slot_index]["block"]
@@ -667,6 +752,15 @@ def client_thread(client, addr):
                                     "y": y,
                                     "block": block_type
                                 })
+                
+                elif msg["type"] == "sync_inventory":
+                    # Client is syncing inventory after drag&drop
+                    hotbar = msg.get("hotbar", [None] * 7)
+                    inventory = msg.get("inventory", [None] * 21)
+                    
+                    player_data[pid]["hotbar"] = hotbar
+                    player_data[pid]["inventory"] = inventory
+                    save_players()
 
             except:
                 break
